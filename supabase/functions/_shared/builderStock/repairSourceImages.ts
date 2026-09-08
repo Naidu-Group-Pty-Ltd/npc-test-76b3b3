@@ -27,14 +27,16 @@
  *   another builder's stock even if two rows happen to read alike.
  */
 import { classifyFetchedSource, classifyStockFile } from './fileTypes.pure.ts';
+import { RUNTIME_VERSION } from './runtimeVersion.pure.ts';
 import { PROCESSED_LIFECYCLE } from './stockLifecycle.pure.ts';
 import { detectDocumentMime } from '../immutableDocuments.ts';
 import { extractStockFile } from './extract.ts';
 import { keyRowsByHeader } from './table.pure.ts';
 import { isNotionUrl } from './urlSource.pure.ts';
 import {
-  emptyStockRecord, identifiesAProperty, normaliseStockRow, stockMatchKeys,
-  stockRecordLabel, stockRowFingerprint,
+  developmentUnitMatchKey, emptyStockRecord, identifiesAProperty,
+  normaliseStockRow, stockIdentityHints,
+  stockMatchKeys, stockRecordLabel, stockRowFingerprint, storedRowDevelopmentUnitKey,
   type NormalisedStockRecord,
 } from './normalise.pure.ts';
 import {
@@ -63,8 +65,39 @@ import {
   DriveListingCache, recoverPackageImage, type PackageFetcher, type PackageOutcome,
 } from './packageImages.ts';
 import { attachDocumentMedia } from './importStock.ts';
+import { designOfRecordOrRow } from './builderSuppliedImage.pure.ts';
 import { anchorPdfRowsToPages, pdfAnchorPage } from './pdfRowAnchors.pure.ts';
 import { chooseAndStorePrimaryImage } from './primaryImage.ts';
+import { readAllRows } from './pagedRead.ts';
+
+/**
+ * The house design a row states, or null — WHICHEVER SHAPE THE CALLER HOLDS.
+ *
+ * THE TWO READERS DIFFER IN WHICH THEY HAVE, and this function used to know
+ * only one of them. It read `record.source_row.house_design`, which is the
+ * shape of a DATABASE ROW: the import writes the whole
+ * `NormalisedStockRecord` into that jsonb column. But the caller here is the
+ * repair path, and it holds the normalised record ITSELF — `storedSourceRows`
+ * returns `readStoredRecord(row.source_row)`, so `house_design` sits at the
+ * top level and there is no `source_row` key to descend into. Every call
+ * therefore answered null.
+ *
+ * MEASURED, 6 SEPTEMBER 2026. The design fallback exists because a builder
+ * sells fewer designs than lots and files one brochure per design; it was
+ * built, tested, documented and shipped, and across the whole live database
+ * it had produced ZERO images: 438 primary images at evidence levels 1, 2 and
+ * 3, and not one at level 4. It could not have produced any, because the
+ * design never reached the election. Lots 502 Mambourin and 1004 Five Farms
+ * are the two rows whose only imagery is a design render, and both were told
+ * their own brochures name no image for them.
+ *
+ * `storedRowDevelopmentUnitKey` learned this same lesson — its header says it
+ * outright: "the two readers differ in which they have ... Looking in both is
+ * what lets one function serve both." This now looks in both, through
+ * `designOfStoredRow`, which is the shared reader the other three callers
+ * already use and which also recovers a design from `unmapped.HOUSE`.
+ */
+const designOf = designOfRecordOrRow;
 import type { ExtractedMedia } from './extract.ts';
 
 export interface RepairOutcome {
@@ -253,16 +286,46 @@ async function readStage1Images(
   return byItem;
 }
 
+/**
+ * Which image row each item is pointing at RIGHT NOW — read after the
+ * re-point so the demote below can spare exactly the row still drawing the
+ * card. See the comment above the demote loop for why the order matters.
+ */
+async function readPrimaryImageIds(
+  db: any,
+  stockItemIds: string[],
+): Promise<Map<string, string | null>> {
+  const pointed = new Map<string, string | null>();
+  const ids = [...new Set(stockItemIds)];
+  for (let index = 0; index < ids.length; index += STAGE1_CHUNK) {
+    const { data } = await db
+      .from('builder_stock_items')
+      .select('id, primary_image_id')
+      .in('id', ids.slice(index, index + STAGE1_CHUNK));
+    for (const row of (data ?? []) as Array<{ id: string; primary_image_id: string | null }>) {
+      pointed.set(row.id, row.primary_image_id ?? null);
+    }
+  }
+  return pointed;
+}
+
 function referenceKey(item: ExistingItem): string | null {
   const value = item.external_reference?.trim().toLowerCase();
   return value || null;
 }
 
-function developmentUnitKey(item: ExistingItem): string | null {
-  const development = (item.development_name ?? item.project_name ?? '').trim().toLowerCase();
-  const unit = (item.unit_number ?? item.lot_number ?? '').trim().toLowerCase();
-  return development && unit ? `${development}|${unit}` : null;
-}
+/**
+ * THE SAME KEY THE IMPORTER USES — the same function, not a copy of it.
+ *
+ * This is the module that decides which property a document's photograph
+ * belongs to, so a key coarser than the importer's is the worst kind of
+ * drift: with three packages on Harlow 801 the map would hold whichever row
+ * was read last and hand every Harlow 801 brochure to it, badged "Builder
+ * supplied", on the wrong house. It was a second copy of the importer's
+ * function until the design had to go into it, which is how a copy announces
+ * itself.
+ */
+const developmentUnitKey = storedRowDevelopmentUnitKey;
 
 /**
  * Re-read one source and attach the imagery it states.
@@ -421,6 +484,9 @@ export async function repairSourceImagesForUpload(
   }
 
   let rows: Array<Record<string, unknown>> = [];
+  /** What the live sheet fetch could see of its link layer, when one ran. */
+  let sheetLinkAvailability: string | null = null;
+  let sheetLinkMethod: string | null = null;
   /**
    * Set only on the stored-source path: rows that are ALREADY records and must
    * not be put through `normaliseStockRow` again. See `readStoredRecord`.
@@ -508,12 +574,49 @@ export async function repairSourceImagesForUpload(
       }
       notionAssetsRead = true;
     } else {
-      const { data: blob, error: downloadError } = await db.storage
-        .from(upload.storage_bucket).download(upload.storage_path);
-      if (downloadError || !blob) {
-        return { ...outcome, error: 'The stored copy of that source could not be read.' };
+      /*
+       * A GOOGLE SHEET IS RE-FETCHED LIVE, FOR THE SAME REASON NOTION IS.
+       *
+       * The stored bytes are what the ORIGINAL fetch could see, and for a
+       * sheet whose exports were refused that is labels with no addresses —
+       * the live VG list's stored `tq.csv` carries the word `Brochure`
+       * fifty-six times and not one URL, so a repair that re-reads storage
+       * can never discover what the import could not. The live fetch runs
+       * today's reader (the workbook export, or the htmlview grid a
+       * locked-export sheet surrenders — see `fetchGoogleSheet`), and what it
+       * resolves is PERSISTED onto the rows below, so the next reading needs
+       * no fetch at all.
+       *
+       * A fetch that fails falls back to the stored copy rather than failing
+       * the run: yesterday's bytes are a worse reading than today's and a far
+       * better one than none.
+       */
+      let bytes: Uint8Array | null = null;
+      if (upload.source_type === 'url' && sourceUrl) {
+        const { googleSheetsRef } = await import('./googleSheetsSource.pure.ts');
+        if (googleSheetsRef(sourceUrl)) {
+          try {
+            const { fetchStockSource } = await import('./fetchSource.ts');
+            const fetched = await fetchStockSource(sourceUrl);
+            bytes = fetched.bytes;
+            sheetLinkAvailability = fetched.hyperlinks ?? null;
+            sheetLinkMethod = fetched.hyperlinkMethod ?? null;
+          } catch (error) {
+            console.warn('[builderStock] live sheet re-fetch failed; using stored copy', {
+              phase: 'source_refetch', upload_id: upload.id,
+              detail: String((error as { message?: string })?.message ?? error).slice(0, 160),
+            });
+          }
+        }
       }
-      const bytes = new Uint8Array(await blob.arrayBuffer());
+      if (!bytes) {
+        const { data: blob, error: downloadError } = await db.storage
+          .from(upload.storage_bucket).download(upload.storage_path);
+        if (downloadError || !blob) {
+          return { ...outcome, error: 'The stored copy of that source could not be read.' };
+        }
+        bytes = new Uint8Array(await blob.arrayBuffer());
+      }
       const detection = detectDocumentMime(bytes);
       const classification = upload.source_type === 'url'
         ? classifyFetchedSource({
@@ -569,13 +672,31 @@ export async function repairSourceImagesForUpload(
   if (!rows.length) return outcome;
 
   // The stock this organisation already holds, and nobody else's.
-  const { data: existingRows } = await db
-    .from('builder_stock_items')
-    .select('id, external_reference, development_name, project_name, unit_number, lot_number, source_row, primary_image_id, source_provenance_result, image_work_attempts')
-    .eq('organisation_id', input.organisationId)
-    .in('lifecycle_status', PROCESSED_LIFECYCLE)
-    .order('created_at', { ascending: true })
-    .limit(20000);
+  /*
+   * PAGED, because `.limit(20000)` is not a number PostgREST honours — the
+   * deployment caps a response at 1,000 rows and reports it in a header
+   * nothing here reads. This index is what decides whether an incoming row is
+   * a property we already hold, so a truncated read does not make a smaller
+   * index: it makes every property past the cut look NEW, which duplicates it,
+   * and leaves its images to be matched against a partial set. `id` is
+   * appended to the ordering because `created_at` is not unique and an
+   * offset-paged read needs a total order. See `pagedRead.ts`.
+   */
+  const existingPage = await readAllRows<ExistingItem>(
+    () => db
+      .from('builder_stock_items')
+      .select('id, external_reference, development_name, project_name, unit_number, lot_number, source_row, primary_image_id, source_provenance_result, image_work_attempts')
+      .eq('organisation_id', input.organisationId)
+      .in('lifecycle_status', PROCESSED_LIFECYCLE)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true }));
+  // A FAILED READ IS NOT AN EMPTY ORGANISATION: matching nothing here means
+  // inserting duplicates of every property the builder already has.
+  if (existingPage.failed) {
+    throw new Error('Existing stock could not be read: '
+      + String((existingPage.error as { message?: string })?.message ?? existingPage.error));
+  }
+  const existingRows = existingPage.rows;
 
   const byReference = new Map<string, string>();
   const byDevelopmentUnit = new Map<string, string>();
@@ -682,7 +803,7 @@ export async function repairSourceImagesForUpload(
     const keys = stockMatchKeys(record);
     const itemId = (keys.reference ? byReference.get(keys.reference) : undefined)
       ?? (keys.developmentUnit
-        ? byDevelopmentUnit.get(`${keys.developmentUnit.development}|${keys.developmentUnit.unit}`)
+        ? byDevelopmentUnit.get(developmentUnitMatchKey(keys.developmentUnit))
         : undefined)
       ?? byFingerprint.get(stockRowFingerprint(record))?.shift();
 
@@ -743,6 +864,32 @@ export async function repairSourceImagesForUpload(
      */
     const branches = rowSourceBranches(
       unmappedWithRecoveredLinks(record.unmapped, storedRowByItem.get(itemId)));
+
+    /*
+     * WHAT THE LIVE FETCH DISCOVERED IS MADE DURABLE ON THE ROW.
+     *
+     * The supplied-evidence gate reads STORED rows, and a row imported before
+     * the link layer could be read carries neither URLs nor a stamp — so the
+     * gate is blind to it however well this run's in-memory branches fare. A
+     * live re-fetch that resolved the layer therefore writes what it learned
+     * back: the URL-bearing columns the stored row lacks (add-only — a
+     * re-read must not lose what the re-read cannot contain), the columns
+     * recorded as recovered, and the `link_discovery` stamp. One write, only
+     * when something changed, and a failed write only means the next sweep
+     * writes it instead.
+     */
+    if (sheetLinkAvailability) {
+      await persistDiscoveredRowLinks(db, {
+        itemId,
+        organisationId: input.organisationId,
+        freshUnmapped: record.unmapped,
+        storedRow: storedRowByItem.get(itemId) ?? null,
+        availability: sheetLinkAvailability,
+        method: sheetLinkMethod,
+      }).then((updated) => {
+        if (updated) storedRowByItem.set(itemId, updated);
+      });
+    }
 
     if (all.length) {
       outcome.matched += 1;
@@ -921,6 +1068,10 @@ export async function repairSourceImagesForUpload(
     const packageUrl = branch.url;
     const question = {
       provenanceVersion: PROVENANCE_VERSION,
+      // What the extractor understands, and — separately — how reliably this
+      // worker can open a document at all. See `runtimeVersion.pure.ts`: only
+      // records of OUR OWN failures compare the second one.
+      runtimeVersion: RUNTIME_VERSION,
       packageReference: packageUrl,
       sourceAnchor: anchor ?? null,
     };
@@ -1104,9 +1255,20 @@ export async function repairSourceImagesForUpload(
         {
           packageUrl,
           label: stockRecordLabel(record),
+          // The estate and project names the display label leaves out, for
+          // the cover rule's corroboration test. See `stockIdentityHints`.
+          identityHints: stockIdentityHints(record),
           // Tells "(178 SqM)" from "(207 SqM)" where a lot has two packages.
           buildingSqm: Number((record as { building_size_sqm?: unknown })?.building_size_sqm)
             || null,
+          /*
+           * The row's own house design, read from the normalised source row.
+           * A builder sells fewer designs than lots and files one brochure per
+           * design, so this is what lets the document that names the HOUSE be
+           * accepted where no document names the LOT. Strictly weaker evidence
+           * — see `roleFromDesignCover`.
+           */
+          design: designOf(record),
         },
         { fetchPackage: deps.fetchPackage, cache, readPageTexts: deps.readPageTexts },
       );
@@ -1153,7 +1315,33 @@ export async function repairSourceImagesForUpload(
      * `linked_package_photo` so the row says which of the two it was.
      */
     if (recovered.status === 'recovered_photograph') {
-      await clearAttempt();
+    /*
+     * THE CLAIM IS HELD UNTIL THE PICTURE IS DURABLE, not until the recovery
+     * returns.
+     *
+     * WHY. `clearAttempt()` used to run here, before the store — and storing
+     * is the most expensive step left: it transcodes, hashes and sanitises a
+     * 3000x1875 raster inside the same uninterruptible invocation. A kill
+     * there therefore lands AFTER the claim has been released, so the column
+     * holds `{"branches": {}}` — no attempt, no verdict, no image — and the
+     * next tick sees an untouched branch, does the same work and dies in the
+     * same place. `packageAttemptsExhausted` can never fire, because the
+     * counter it reads was erased on the way in.
+     *
+     * PRODUCTION, 2 SEPTEMBER 2026. Lot 824 Sorrel Way, `image_work_attempts`
+     * 8, stage `source`, `source_provenance_result` exactly `{"branches": {}}`
+     * and no `linked_package` image row. Claimed 04:00:02; `CPU Time exceeded`
+     * 04:00:12. Its brochure reads fine — 7.2 MB, 15 pages, a 3000x1875 render
+     * on page 2, selected in 4.4 s — so nothing was wrong with the document
+     * and nothing was wrong with the reader. The property had been cycling on
+     * a one-hour backoff since the list was imported.
+     *
+     * So the claim is released only once the row is written. A store that
+     * FAILS leaves it standing too, which is correct for the same reason: the
+     * question is unanswered, the next attempt counts, and two of them retire
+     * the branch as `operational` — a blank card with a legible reason, never
+     * an exhaustion the online fallback could be bought with.
+     */
       const photo = recovered.photograph;
       if (!all.length) {
         outcome.rowsWithImagery += 1;
@@ -1184,6 +1372,7 @@ export async function repairSourceImagesForUpload(
         },
       });
       if (storedPhoto) {
+        await clearAttempt();
         outcome.imagesStored += 1;
         outcome.fromPackage += 1;
         prove(itemId, photo.reference);
@@ -1203,6 +1392,9 @@ export async function repairSourceImagesForUpload(
             writeBranchState(negativeBefore.get(itemId), packageUrl, null));
         }
       } else {
+        // The claim STANDS: nothing durable happened, so this question is
+        // still unanswered and the next attempt must count towards retiring it.
+        outcome.incomplete = true;
         outcome.problems.push({
           reference: photo.reference,
           reason: 'The recovered photograph could not be stored.',
@@ -1213,11 +1405,20 @@ export async function repairSourceImagesForUpload(
 
     if (recovered.status !== 'recovered') {
       outcome.packageNotIdentified += 1;
+      /*
+       * `INSPECTED`, AND ONLY HERE. This path is reached when
+       * `recoverPackageImage` OPENED the document, read it, and found nothing
+       * that names this property — the one negative that is knowledge about
+       * the document rather than about us, and therefore the one that may
+       * admit the online fallback. Every other retirement in this file goes
+       * through `recordPackageUnreachable` or `recordPackageUnprocessable`,
+       * which say `operational`. See `suppliedEvidence.pure.ts`.
+       */
       const { error: writeError } = await db
         .from('builder_stock_items')
         .update({ source_provenance_result: writeBranchState(
           negativeBefore.get(itemId), packageUrl,
-          recordNoDeterministicImage(question, recovered.detail)) })
+          recordNoDeterministicImage(question, recovered.detail, 'inspected')) })
         .eq('id', itemId)
         .eq('organisation_id', input.organisationId);
       if (writeError) {
@@ -1230,11 +1431,8 @@ export async function repairSourceImagesForUpload(
       continue;
     }
 
-    // RECOVERED. The step returned, so the claim is spent: clear it, or a
-    // future question about this property would inherit a failure that never
-    // happened.
-    await clearAttempt();
-
+    // RECOVERED. See the note on the photograph path above: the claim is held
+    // until the row is written, because storing is where the worker dies.
     // A row that fell through with convicted assets was already counted once.
     if (!all.length) {
       outcome.rowsWithImagery += 1;
@@ -1277,6 +1475,7 @@ export async function repairSourceImagesForUpload(
       },
     });
     if (written) {
+      await clearAttempt();
       outcome.imagesStored += 1;
       outcome.fromPackage += 1;
       prove(itemId, recovered.image.reference);
@@ -1296,6 +1495,8 @@ export async function repairSourceImagesForUpload(
         negativeBefore.delete(itemId);
       }
     } else {
+      // The claim STANDS — see above.
+      outcome.incomplete = true;
       outcome.problems.push({
         reference: recovered.image.reference,
         reason: 'The recovered image could not be stored.',
@@ -1346,11 +1547,41 @@ export async function repairSourceImagesForUpload(
     ? new Map<string, Array<{ id: string; processing_status: string;
       source_reference: string | null; source_detail: Record<string, unknown> | null }>>()
     : await readStage1Images(db, itemIdsInOrder);
+  /*
+   * THE CARD'S STANDING IMAGE OUTLIVES ITS OWN RE-DERIVATION.
+   *
+   * The demote used to run BEFORE the primary was re-chosen, and a freshly
+   * stored replacement is not displayable until its eligibility and
+   * sanitization stamps exist — so for the whole of that window the item had
+   * no primary at all and the live card read "Finding a picture…" about a
+   * property whose picture was fine minutes earlier. Measured, 6 September
+   * 2026: every version bump rolls a re-derivation across the settled fleet
+   * one row at a time, and each row's turn blanked its card for minutes (Lot
+   * 516 Winterset was the one caught on screen).
+   *
+   * So the pointer moves FIRST, and the demote then skips whichever row is
+   * still being pointed at: a stale-version primary keeps drawing the card
+   * until the pass whose replacement is actually displayable takes over, at
+   * which point the old row stops being the pointer and is demoted exactly
+   * as before. A background re-derivation becomes invisible — the swap is
+   * the only observable event. The deliberate trade, stated: an image this
+   * run could not re-prove now stands until its replacement lands rather
+   * than vanishing immediately; withdrawal-with-nothing-better still happens
+   * the moment the pointer row itself stops being chosen for any other
+   * reason, and every non-pointer stale row is demoted exactly as it always
+   * was.
+   */
+  for (const itemId of touched) {
+    const primary = await chooseAndStorePrimaryImage(db, itemId);
+    if (primary && primary !== (primaryBefore.get(itemId) ?? null)) outcome.primaryUpdated += 1;
+  }
+  const pointedNow = await readPrimaryImageIds(db, [...new Set(itemIdsInOrder)]);
   for (const itemId of new Set(itemIdsInOrder)) {
     const proven = provenByItem.get(itemId) ?? new Set<string>();
 
     for (const row of stage1ByItem.get(itemId) ?? []) {
       if (row.processing_status !== 'ready') continue;
+      if (row.id === pointedNow.get(itemId)) continue;
       const reference = String(row.source_reference ?? '');
       if (proven.has(reference)) continue;
       const version = Number((row.source_detail ?? {}).provenance_version ?? 0);
@@ -1364,11 +1595,6 @@ export async function repairSourceImagesForUpload(
       });
       outcome.demoted += 1;
     }
-  }
-
-  for (const itemId of touched) {
-    const primary = await chooseAndStorePrimaryImage(db, itemId);
-    if (primary && primary !== (primaryBefore.get(itemId) ?? null)) outcome.primaryUpdated += 1;
   }
 
   /**
@@ -1445,18 +1671,23 @@ async function repairPdfUpload(
   },
   outcome: RepairOutcome,
 ): Promise<RepairOutcome> {
-  const { data: items } = await db
+  // Paged for the reason above, and ordered totally so no page can repeat or
+  // drop a property. An upload of more than 1,000 rows is ordinary.
+  const itemPage = await readAllRows<ExistingItem & {
+    address_line?: string | null; suburb?: string | null;
+  }>(() => db
     .from('builder_stock_items')
     .select('id, external_reference, development_name, project_name, unit_number, lot_number, address_line, suburb, source_row, primary_image_id')
     .eq('organisation_id', input.organisationId)
     .eq('upload_id', input.upload.id)
     .in('lifecycle_status', PROCESSED_LIFECYCLE)
     .order('created_at', { ascending: true })
-    .limit(5000);
-
-  const existing = (items ?? []) as Array<ExistingItem & {
-    address_line?: string | null; suburb?: string | null;
-  }>;
+    .order('id', { ascending: true }));
+  if (itemPage.failed) {
+    throw new Error('Upload stock could not be read: '
+      + String((itemPage.error as { message?: string })?.message ?? itemPage.error));
+  }
+  const existing = itemPage.rows;
   outcome.rowsRead = existing.length;
   outcome.rowsWithImagery = input.media.length;
   if (!existing.length || !input.media.length) return outcome;
@@ -1551,8 +1782,17 @@ async function repairPdfUpload(
     }
     const proven = provenByItem.get(item.id) ?? new Set<string>();
 
+    // Re-point FIRST, then spare the row still drawing the card — the same
+    // order as the row path above, for the same measured reason: demoting
+    // the standing primary before its replacement is displayable blanks the
+    // live card for the whole eligibility-and-sanitization window.
+    const primary = await chooseAndStorePrimaryImage(db, item.id);
+    if (primary && primary !== (item.primary_image_id ?? null)) outcome.primaryUpdated += 1;
+    const pointedRow = primary ?? item.primary_image_id ?? null;
+
     for (const row of stage1ByItem.get(item.id) ?? []) {
       if (row.processing_status !== 'ready') continue;
+      if (row.id === pointedRow) continue;
       if (proven.has(String(row.source_reference ?? ''))) continue;
       if (Number((row.source_detail ?? {}).provenance_version ?? 0) >= PROVENANCE_VERSION) continue;
       await demoteUnprovenSourceImage(db, {
@@ -1562,9 +1802,6 @@ async function repairPdfUpload(
       });
       outcome.demoted += 1;
     }
-
-    const primary = await chooseAndStorePrimaryImage(db, item.id);
-    if (primary && primary !== (item.primary_image_id ?? null)) outcome.primaryUpdated += 1;
   }
 
   return outcome;
@@ -1582,3 +1819,83 @@ async function repairPdfUpload(
  * every one of them, attached to its own row and its own heading.
  */
 
+/**
+ * Write what a live source fetch discovered about one row's links back onto
+ * the stored row, add-only, and return the updated row for the run's own use.
+ *
+ * See the call site for why this exists. Three rules: nothing stored is ever
+ * removed or overwritten with a DIFFERENT value (a recovered column that
+ * already carries a URL keeps it); the write happens only when it would
+ * change something; and a failure is logged and swallowed — durability is a
+ * convenience for the NEXT reading, never a condition of this one.
+ */
+export async function persistDiscoveredRowLinks(
+  db: any,
+  input: {
+    itemId: string;
+    organisationId: string;
+    freshUnmapped: Record<string, string> | null | undefined;
+    storedRow: Record<string, unknown> | null;
+    availability: string;
+    method: string | null;
+  },
+): Promise<Record<string, unknown> | null> {
+  try {
+    const stored = input.storedRow ?? {};
+    const storedUnmapped = (stored.unmapped ?? {}) as Record<string, unknown>;
+    const storedRecovered = Array.isArray(stored.recovered_link_columns)
+      ? (stored.recovered_link_columns as unknown[]).filter(
+        (column): column is string => typeof column === 'string')
+      : [];
+
+    const additions: Record<string, string> = {};
+    for (const [column, value] of Object.entries(input.freshUnmapped ?? {})) {
+      if (typeof value !== 'string' || !/https?:\/\//i.test(value)) continue;
+      const existing = storedUnmapped[column];
+      if (typeof existing === 'string' && /https?:\/\//i.test(existing)) continue;
+      additions[column] = value;
+    }
+
+    const { linkDiscoveryFromAvailability, readLinkDiscovery } = await import(
+      './suppliedEvidence.pure.ts');
+    const stamp = linkDiscoveryFromAvailability(input.availability, input.method);
+    const storedStamp = readLinkDiscovery(stored);
+    const stampChanged = !!stamp
+      && (storedStamp?.state !== stamp.state || storedStamp?.method !== stamp.method);
+
+    if (!Object.keys(additions).length && !stampChanged) return null;
+
+    const nextRow: Record<string, unknown> = {
+      ...stored,
+      unmapped: { ...storedUnmapped, ...additions },
+      recovered_link_columns: [...new Set([...storedRecovered, ...Object.keys(additions)])],
+      ...(stamp ? { link_discovery: stamp } : {}),
+    };
+
+    const { error } = await db
+      .from('builder_stock_items')
+      .update({ source_row: nextRow })
+      .eq('id', input.itemId)
+      .eq('organisation_id', input.organisationId);
+    if (error) {
+      console.warn('[builderStock] discovered links could not be persisted', {
+        phase: 'link_persist', stock_item_id: input.itemId,
+        detail: String((error as { message?: string })?.message ?? error).slice(0, 160),
+      });
+      return null;
+    }
+    console.info('[builderStock] discovered links persisted', {
+      phase: 'link_persist', stock_item_id: input.itemId,
+      columns_added: Object.keys(additions).length,
+      link_discovery: stamp?.state ?? null,
+      method: stamp?.method ?? null,
+    });
+    return nextRow;
+  } catch (error) {
+    console.warn('[builderStock] discovered links could not be persisted', {
+      phase: 'link_persist', stock_item_id: input.itemId,
+      detail: String((error as { message?: string })?.message ?? error).slice(0, 160),
+    });
+    return null;
+  }
+}

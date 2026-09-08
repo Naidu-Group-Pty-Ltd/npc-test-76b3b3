@@ -40,9 +40,13 @@
  */
 import { driveFileId, driveFolderId } from './drivePackage.pure.ts';
 import {
-  NO_DETERMINISTIC_IMAGE, type ProvenanceQuestion,
+  NO_DETERMINISTIC_IMAGE, negativeProvenanceStillStands,
+  type ProvenanceQuestion,
 } from './negativeProvenance.pure.ts';
-import { PACKAGE_RECOVERY_ATTEMPT, MAX_PACKAGE_ATTEMPTS } from './packageAttempt.pure.ts';
+import {
+  PACKAGE_RECOVERY_ATTEMPT, packageAttemptsExhausted,
+} from './packageAttempt.pure.ts';
+import { RUNTIME_VERSION } from './runtimeVersion.pure.ts';
 
 /** What a link can be asked for, decided by the URL alone. */
 export type BranchKind =
@@ -88,6 +92,61 @@ export function classifyBranch(url: string): BranchKind {
   if (IMAGE_EXTENSION.test(parsed.pathname)) return 'direct_image';
   if (DOCUMENT_EXTENSION.test(parsed.pathname)) return 'document';
   return 'unsupported';
+}
+
+/**
+ * THE ADDRESS OF THE FILE, WHERE A HOST PUBLISHES A PREVIEW PAGE AT THE LINK.
+ *
+ * A shared-link host serves two different things at one address: a person
+ * opening it gets an interactive preview, and the file itself is behind a
+ * parameter the host publishes for exactly that purpose. Fetched without it,
+ * a brochure link answers 207 KB of `text/html` — the viewer APPLICATION —
+ * and the reader downstream does not fail, it succeeds at reading the wrong
+ * thing. Measured on the live Luxton source: every one of its thirteen
+ * brochures came back as Dropbox's preview page, and the PDF behind it is
+ * 6.2 MB.
+ *
+ * THIS IS NOT A USER-AGENT TRICK, and that was measured too. Dropbox serves
+ * the file to `curl/8.5.0` and the preview to `python-requests`, to
+ * `Mozilla/5.0`, to a Chrome string and to no user agent at all — so the only
+ * stable way through is the one the host documents, and dressing this client
+ * up as a browser would be both dishonest and unreliable.
+ *
+ * THREE RULES, and the first is what makes it safe to run on every retrieval:
+ *
+ *   ONLY A QUERY PARAMETER MOVES. The scheme, the host, the port and the path
+ *   are returned exactly as they arrived, so this cannot redirect a fetch
+ *   anywhere — the SSRF guard downstream is judging the same origin it would
+ *   have judged, and a test asserts it.
+ *
+ *   ONLY A HOST THAT PUBLISHES ONE. There is one entry below because one was
+ *   measured. A host added here without a retrieval that proves it is a guess
+ *   about somebody else's service, and the failure it produces is the silent
+ *   kind. Google Drive is absent because it never reaches here: a Drive link
+ *   classifies as `drive_file` or `drive_folder` and `driveDownloadUrl`
+ *   already addresses it.
+ *
+ *   AND IT IS IDEMPOTENT. A builder who pastes the download form of their own
+ *   link gets it back unchanged.
+ */
+export function sharedLinkFileUrl(rawUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return rawUrl;
+
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  // Dropbox: `dl=1` is its own published way of asking for the file rather
+  // than the viewer. `dl=0` is what a "Copy link" button writes.
+  if (host === 'dropbox.com' || host === 'dropboxusercontent.com') {
+    if (parsed.searchParams.get('dl') === '1') return rawUrl;
+    parsed.searchParams.set('dl', '1');
+    return parsed.toString();
+  }
+  return rawUrl;
 }
 
 /** A branch this pipeline can actually try to take a photograph out of. */
@@ -234,8 +293,11 @@ export function branchQuestion(
   branch: RowSourceBranch,
   provenanceVersion: number,
   sourceAnchor: string | null,
+  runtimeVersion: number = RUNTIME_VERSION,
 ): ProvenanceQuestion {
-  return { provenanceVersion, packageReference: branch.url, sourceAnchor };
+  return {
+    provenanceVersion, packageReference: branch.url, sourceAnchor, runtimeVersion,
+  };
 }
 
 /**
@@ -246,8 +308,10 @@ export function branchQuestion(
  * nothing here can take a photograph out of it at all. Only the first two are
  * findings about the document.
  *
- * A branch whose record belongs to a DIFFERENT question — a bumped version, a
- * changed anchor — is not finished, because that record answers something else.
+ * A branch whose record belongs to a DIFFERENT question — a bumped extractor
+ * version, a changed anchor, or a retirement OUR OWN worker caused under a
+ * runtime that has since been superseded — is not finished, because that
+ * record answers something else.
  */
 export function branchTerminal(
   stored: unknown,
@@ -261,9 +325,20 @@ export function branchTerminal(
   if (Number(record.provenance_version) !== question.provenanceVersion) return false;
   if ((record.source_anchor ?? null) !== (question.sourceAnchor ?? null)) return false;
 
-  if (record.result === NO_DETERMINISTIC_IMAGE) return true;
+  /*
+   * BOTH TERMINAL ANSWERS ARE READ BY THE MODULE THAT WROTE THEM, and that is
+   * the whole of this fix. This function used to read `result` and `attempts`
+   * off the record itself, which meant it agreed with those two modules on
+   * every question except the one the runtime version exists to ask — so a
+   * runtime bump reopened a property's ROW while its branches stayed shut, and
+   * the settler claimed it, found nothing open, and re-settled it within the
+   * second. Delegating is what keeps the three predicates from drifting again.
+   */
+  if (record.result === NO_DETERMINISTIC_IMAGE) {
+    return negativeProvenanceStillStands(record, question);
+  }
   if (record.result === PACKAGE_RECOVERY_ATTEMPT) {
-    return Number(record.attempts ?? 0) >= MAX_PACKAGE_ATTEMPTS;
+    return packageAttemptsExhausted(record, question);
   }
   return false;
 }
@@ -282,9 +357,11 @@ export function openBranches(
   branches: RowSourceBranch[],
   provenanceVersion: number,
   sourceAnchor: string | null,
+  runtimeVersion: number = RUNTIME_VERSION,
 ): RowSourceBranch[] {
   return branches.filter((branch) => !branchTerminal(
-    stored, branch, branchQuestion(branch, provenanceVersion, sourceAnchor)));
+    stored, branch,
+    branchQuestion(branch, provenanceVersion, sourceAnchor, runtimeVersion)));
 }
 
 /**
@@ -330,6 +407,8 @@ export function allBranchesTerminal(
   branches: RowSourceBranch[],
   provenanceVersion: number,
   sourceAnchor: string | null,
+  runtimeVersion: number = RUNTIME_VERSION,
 ): boolean {
-  return openBranches(stored, branches, provenanceVersion, sourceAnchor).length === 0;
+  return openBranches(
+    stored, branches, provenanceVersion, sourceAnchor, runtimeVersion).length === 0;
 }
