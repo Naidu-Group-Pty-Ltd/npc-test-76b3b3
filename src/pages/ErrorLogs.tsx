@@ -30,6 +30,7 @@ import { invokeSecureFunction } from '@/lib/secureInvoke';
 import { useToast } from '@/hooks/use-toast';
 import { format, formatDistanceToNow, subDays } from 'date-fns';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { SearchInput } from '@/components/ui/search-input';
 import { Link } from 'react-router-dom';
 import { useSecureCallLogs } from '@/hooks/useSecureCallLogs';
 import { DashboardThemeFrame } from '@/components/layout/DashboardThemeFrame';
@@ -296,11 +297,15 @@ export default function ErrorLogs() {
 
   const handleRetryReport = async (reportId: string, address: string) => {
     try {
-      // First, reset the report status to pending
-      await supabase
-        .from('investment_reports')
-        .update({ status: 'pending', error_message: null })
-        .eq('id', reportId);
+      // First, reset the report status to pending — through the broker every
+      // client write uses. A browser UPDATE is author-scoped by RLS, so for a
+      // colleague's report it matched zero rows and reported nothing.
+      const reset = await invokeSecureFunction('manage-investment-reports', {
+        action: 'update',
+        reportId,
+        data: { status: 'pending', error_message: null },
+      });
+      if (reset.error) throw reset.error;
 
       // Call the edge function to regenerate
       const { error } = await invokeSecureFunction('generate-investment-report', {
@@ -479,16 +484,14 @@ export default function ErrorLogs() {
         <CardContent className="min-w-0">
           <div className="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(10rem,12rem)_minmax(9rem,10rem)_minmax(8.5rem,9rem)] lg:items-center">
             <div className="min-w-0">
-              <div className="relative min-w-0">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  aria-label="Search errors"
-                  placeholder="Search errors..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="min-w-0 rounded-2xl border-border/70 bg-background/70 pl-9 pr-3 shadow-inner shadow-black/5 transition-all duration-200 placeholder:text-muted-foreground/70 hover:border-primary/30 focus-visible:border-primary/45 focus-visible:ring-2 focus-visible:ring-primary/35 dark:border-white/10 dark:bg-background/55"
-                />
-              </div>
+              <SearchInput
+                value={searchQuery}
+                onValueChange={setSearchQuery}
+                aria-label="Search errors"
+                placeholder="Search errors..."
+                containerClassName="min-w-0"
+                className="min-w-0 rounded-2xl border-border/70 bg-background/70 pr-3 shadow-inner shadow-black/5 transition-all duration-200 placeholder:text-muted-foreground/70 hover:border-primary/30 focus-visible:border-primary/45 focus-visible:ring-2 focus-visible:ring-primary/35 dark:border-white/10 dark:bg-background/55"
+              />
             </div>
 
             <Select value={selectedSource} onValueChange={(v) => setSelectedSource(v as ErrorSource | 'all')}>
