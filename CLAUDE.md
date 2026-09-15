@@ -1465,6 +1465,29 @@ contradict. Placement is load-bearing: **after** the series heal (the ROI
 denominator is the stored deposit) and **before** the upfront total (which is
 the deposit plus the acquisition lines).
 
+## The 291 Stone Mason Drive audit (QA-291SM)
+Read [`docs/reports/QA_291SM_REMEDIATION_TRACKER.md`](./docs/reports/QA_291SM_REMEDIATION_TRACKER.md)
+before touching the standard (pdf-lib) presentation, the fork's section
+routing, the condense guides, the financial engine's loan arithmetic or the
+cash-flow seeding: it records forty findings against six real documents and
+what each turned out to be. Four rules from it keep biting. **A figure a
+document prints is a figure the record holds** — the Briefing invented an
+"overall fit 68/100" nothing held (`scoreClaims.pure.ts` removes the sentence
+and the validator reports the class), and the renderer's override injection
+matched `Interest Rate.*?NN%` and rewrote every sensitivity label with the
+base rate, so every injection now matches an explicit `Label: NN%` and
+nothing else. **What a section may hold is read from its body, not its
+heading** (`forkSectionContracts.pure.ts`): the risk register is split by
+what each entry is about, a SEIFA heading needs an index, a checklist is
+named as one. **A promise of a figure is a figure** — a directive the
+standard presentation cannot draw is tabulated (`vizDirectiveTables.pure.ts`),
+never dropped behind the sentence that introduced it, and the word-cap cut
+works in whole blocks so a bullet cannot lose its explanation or a pair of
+lists its second half. And **one loan ledger** (`loanLedger.pure.ts`) drives
+projections, metrics and sensitivities, so "interest only" is never projected
+with P&I arithmetic. The render service's 503 is a separate matter:
+[`RENDER_SERVICE_AVAILABILITY.md`](./docs/reports/RENDER_SERVICE_AVAILABILITY.md).
+
 ## Generated reports / PDFs
 **Read [`docs/reports/COVERAGE.md`](./docs/reports/COVERAGE.md) before anything
 else here.** The design system renders **0.14%** of the documents this product
@@ -1739,6 +1762,75 @@ engine reads attributes on SVG text, not `style`** — `font-size="6.5"` sets
 five `:::` fences the generator's prompt asks for (pull quote, sidenote, stat,
 divider, quote page) are DRAWN by `renderMarkdown` now — they printed raw on
 every structure — with an unknown kind unwrapped rather than printed.
+
+**Market Intelligence and Report Q&A are on the geometry too, and their
+omission notes are folded, not paged.** Read §7 of the same doc before
+touching `geometryAwareFormat`, `planNarrative`'s pages-path reader,
+`NARRATIVE_NOTES_KEY` or `PackOptions.reserveLines`. Neither format had a
+profile, so their runs packed at 34 estimated lines against a ~46-line box:
+measured on the Chancery renders, MI continuation pages were 20–40% full
+while the same layers were clipped by up to 14 pages and 4 of 41 pages
+carried only the "This section continues" callout; the Q&A answer was cut at
+8 of an estimated 26 pages with half-empty pages before the cut. Four rules.
+**A format joins the geometry by being measured**, and only where the
+renderer files one — a block on its own packs as before and no projection
+estimate changes. **The pages path is read off the continuation conditional**
+(`marketIntel.layers[0].pages > n`, `qa.answerPages > n`), never assumed, and
+the copy that writes the true count keeps an array an array. **A note the
+master gave a page of its own is folded onto the last allowed page**, its
+counts rewritten to the renderer's truth, the room held back by the packer so
+nothing overflows. And **a numbered step keeps its bulleted sub-points and its
+number**: a nested run of the other kind belongs to the item above it (nesting
+by rank of indentation), and a resumed ordinal is written as
+`counter-reset: list-item` because WeasyPrint 69.0 ignores `<ol start>` —
+`styleTags` merges a tag's own style rather than writing a second attribute
+the parser drops.
+
+**A placeholder never reaches a client document — the owner's rule is "N/A or
+unavailable, never".** Read §8 of
+[`RUNTIME_CONSOLIDATION.md`](./docs/reports/RUNTIME_CONSOLIDATION.md) before
+touching `presentStoredMarkdown`, the ungraded branch of
+`reportBindingProjection`, the scorecard rows, `UNSTATED_CONFIDENCE` or any
+generator prompt that mentions a missing figure. Every Executive Briefing in
+production carried 36–97 "N/A" cells and rendered them verbatim, because
+`stripPlaceholderRows` ran on the WRITE path alone and every stored row
+predated it — so the same scrub now runs where stored content is READ, at the
+four readers, by one imported implementation, byte-identical on a clean
+document. Three rules bite. **An absence is omitted, never worded**: an
+ungraded record publishes no verdict at all (the headline used to read "Not
+available — insufficient verified evidence"), an unscored dimension draws no
+row ("Not assessed" beside a dash), and a chip with nothing to state is not
+drawn. **A prompt never asks for a placeholder, an estimate or a confession** —
+the governed authority's recovery sentence says what the analysis rests on,
+never what it lacks, and the generator hands the model only the dimensions
+that scored. And **prose is never regex-scrubbed**, on read or on write:
+`neverAPlaceholder.spec.ts` scans structure and source, not sentences.
+
+**One finalisation is one PDF, on every format — and every exit points at
+it.** Read §9 of [`RUNTIME_CONSOLIDATION.md`](./docs/reports/RUNTIME_CONSOLIDATION.md)
+before touching a `deliver*` module, `publishReportToPortal`, the Cash Flow
+modal's send path or `deliverMarketIntelligencePdf`. Every one of the nine
+non-Investment formats already drew its own document with the pinned
+WeasyPrint engine, and four things were off the pattern, each invisible from
+the outside: a chosen template was drawn by the browser's jsPDF on all nine
+(`routeReportThroughTemplate` defaults to `renderer: 'browser'` and only the
+Investment delivery named the final one, so choosing a template DOWNGRADED the
+document); Cash Flow's "Send to Client" shipped a jsPDF with its own chart
+switches while "Generate PDF" shipped the typeset one; the two on-publish
+portal renders fetched the route's bytes back and uploaded a second copy, so
+the ledger named one object and the portal another; and Market Intelligence
+entered its template path only when `persist` was off, on a button that
+defaults it on. Four rules. **A delivery names the final renderer**
+(`finalRendererOnEveryFormat.spec.ts` scans for it and forbids it anywhere
+else). **Where the bytes already are is part of the answer** — every blob
+helper returns `storagePath`, the three routes return `path`, and a publish
+points rather than copies; an upload survives only for a document nothing
+stored. **A moved override is a different document**: the Cash Flow send
+reuses a produced document only while `cashFlowFinalKey` (series, scenario,
+template choice) still matches. And **a switch the document cannot honour is
+removed, never left dead** — the send dialog's chart toggles reached only
+jsPDF and are gone, while the export menu's own switches still govern the
+legacy download, which stays a named choice.
 
 `INVESTMENT.md` is the one to read before touching anything the *model* draws. Its prose carries a chart vocabulary the generator's
 prompt demands and the renderer had never parsed: **3,753 `{{bars: ...}}`-style
